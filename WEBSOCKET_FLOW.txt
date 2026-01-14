@@ -1,0 +1,99 @@
+WebSocket Flow — Start to End (User-facing)
+
+Purpose
+- Describe the full lifecycle of WebSocket interactions in this project: how clients connect, subscribe to order updates, send/receive chat, and how server-side events (order creation/status change) are delivered in real time.
+
+Quick summary
+- WS URL: ws://127.0.0.1:8000/ws/shop/
+- Two logical channels/groups:
+  - `chat` (global broadcast for chat and general notifications)
+  - `order_<id>` (per-order group for order-status updates)
+
+Client (browser) flow — step by step
+1) Open page
+   - User opens `http://127.0.0.1:8000/` in browser. The page `index.html` and script `main.js` load.
+
+2) Create WebSocket connection
+   - JS opens a WebSocket to the server:
+     const sock = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/shop/');
+   - On connect the server accepts and adds the connection to the `chat` group automatically. This allows the client to receive global chat and creation notifications.
+
+3) Create an order (REST)
+   - User clicks Buy on the UI; frontend sends a POST to `/api/orders/` with JSON body:
+     {"product": 1, "quantity": 2}
+   - Backend creates the Order model instance, decrements Product.stock and returns order JSON.
+   - Immediately after creation the view broadcasts a short message to `chat` group so connected users (including the creator) see an immediate notification:
+     Group message: { type: 'chat.message', message: 'Order created: 5 status=Pending' }
+   - Frontend receives the chat broadcast, shows 'Created order <id>' in the UI, and then sends a WS frame to join the order-specific group:
+     sock.send(JSON.stringify({ action: 'join_order', order_id: 5 }));
+   - Server responds with an acknowledgement frame: {"joined": 5}
+
+4) Subscribe to order updates
+   - When client joins `order_5`, server adds connection to that group. Later, when the Order.status changes, only members of `order_5` receive the `order_update` message.
+
+5) Change order status (admin or payment)
+   - Admin updates order in `/admin/` or Payment.save() sets Order to Completed.
+   - Model `Order.save()` detects status change and sends a group message to `order_<id>`:
+     group_send('order_5', { 'type': 'order.update', 'order_id': 5, 'status': 'Completed' })
+   - Consumer method `order_update` transforms that into a socket message delivered to clients:
+     {"type":"order_update","order_id":5,"status":"Completed"}
+
+6) Chat messages
+   - Any connected client can send a chat frame:
+     sock.send(JSON.stringify({ action: 'chat', message: 'Hello admin' }));
+   - Server broadcasts to `chat` group, all connected clients receive:
+     {"type":"chat","message":"Hello admin"}
+
+
+Message formats (examples)
+- Client -> Server
+  - Join order: {"action":"join_order","order_id": 5}
+  - Chat: {"action":"chat","message":"hello"}
+
+- Server -> Client
+  - Join ack: {"joined": 5}
+  - Chat frame: {"type": "chat", "message": "..."}
+  - Order update: {"type": "order_update", "order_id": 5, "status": "Completed"}
+
+Server-side bindings (where things happen)
+- `shop/consumers.py` handles WebSocket lifecycle and group messages.
+  - `connect()` accepts and subscribes to `chat`.
+  - `receive()` handles JSON frames and dispatches join or chat actions.
+  - `order_update()` and `chat_message()` are handlers invoked by `group_send`.
+- `shop/views.py` (CreateOrder) broadcasts creation message to `chat` group after order creation.
+- `shop/models.py` (Order.save) sends group message to `order_<id>` when status changes.
+
+Server logs (what to expect)
+- On connect: a printed line like: [ws] connect: channel=specific..inmemory!abc path=/ws/shop/
+- On receive join: [ws] receive: channel=... action=join_order data={...}
+- On order_update: [ws] order_update event={'order_id':5,'status':'Completed'}
+
+Testing instructions
+- Browser Console (fastest):
+  1. Open `http://127.0.0.1:8000/` and press F12 → Console.
+  2. Run the connect snippet and watch logs for `open` and incoming frames.
+  3. Use the page UI to create an order; observe chat creation message and joined ack.
+  4. In admin change order status; observe `order_update` frames in console.
+
+- Postman (WebSocket):
+  1. Create a WebSocket request to ws://127.0.0.1:8000/ws/shop/.
+  2. Send: {"action":"join_order","order_id":5} then send status changes from admin and observe frames.
+
+- wscat (CLI):
+  npm i -g wscat
+  wscat -c ws://127.0.0.1:8000/ws/shop/
+  > {"action":"chat","message":"hi"}
+
+Troubleshooting
+- 404 on handshake: you're running a WSGI server (`manage.py runserver`) instead of an ASGI server. Run Uvicorn or Daphne:
+  uvicorn storeproj.asgi:application --host 127.0.0.1 --port 8000
+- No admin CSS: run `python manage.py collectstatic` and ensure WhiteNoise is configured (settings include WhiteNoise middleware and STATIC_ROOT).
+- No order updates received after status change: make sure the client called `join_order` for the correct `order_id` and check server logs for `order.update` send.
+
+Security and notes
+- Order creation uses the REST API and requires CSRF for browser POSTs. Frontend sends `X-CSRFToken` header taken from cookie.
+- In-memory channel layer is fine for development. For production or multi-process testing, configure Redis in `CHANNEL_LAYERS`.
+
+Optional improvements
+- Private notifications: if you want only the user who created the order to receive immediate creation notices (not broadcast), add a per-user group or token and target that group on creation.
+- Add authentication to WebSocket (use `AuthMiddlewareStack` and login session cookie) to associate sockets with users.

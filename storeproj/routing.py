@@ -3,7 +3,9 @@ from shop import consumers
 
 websocket_urlpatterns = [
     re_path(r'ws/shop/$', consumers.ShopConsumer.as_asgi()),
+    some thing =tr
 ]
+
 #i am adding comment here
 
 
